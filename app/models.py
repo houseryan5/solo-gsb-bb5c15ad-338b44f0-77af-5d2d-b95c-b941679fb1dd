@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -1008,3 +1008,93 @@ class RouteSimulateResponse(BaseModel):
         list[RouteSimResult], Field(description="逐项路由结果，按原始输入索引升序")
     ]
     final_balances: Annotated[dict[str, float], Field(description="模拟结束时所有桶的余额")]
+
+
+class QueueSimRequest(SimRequest):
+    """排队试算请求：/simulate 请求字段 + 不早于 timestamp 的 deadline。
+
+    deadline: 请求的截止时刻（秒，与 timestamp 同一时间原点）；
+    队首在 deadline 前未等到链上余额充足则过期（expired）。
+    """
+
+    deadline: Annotated[float, Field(description="截止时刻（秒），必须不早于 timestamp")]
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def _validate_deadline(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("deadline 必须是有限数值")
+        return value
+
+    @model_validator(mode="after")
+    def _check_deadline_not_before_timestamp(self):
+        if float(self.deadline) < float(self.timestamp):
+            raise ValueError("deadline 必须不早于 timestamp")
+        return self
+
+
+class QueueSimulateRequest(BaseModel):
+    """POST /queue-simulate 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    buckets: Annotated[list[BucketSpec], Field(min_length=1, description="令牌桶集合")]
+    requests: Annotated[
+        list[QueueSimRequest],
+        Field(min_length=1, description="按到达时间排入严格 FIFO 队列的请求序列"),
+    ]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors = _simulate_cross_validation_errors(self.buckets, self.requests)
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class QueueSimResult(BaseModel):
+    """单项排队请求的结果。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: Annotated[float, Field(description="到达时刻")]
+    deadline: Annotated[float, Field(description="截止时刻")]
+    status: Annotated[
+        Literal["executed", "expired"],
+        Field(description="executed = 已原子扣减执行；expired = 到期仍未执行"),
+    ]
+    executed_at: Annotated[
+        float | None, Field(default=None, description="实际执行时刻；expired 时为 null")
+    ] = None
+    expired_at: Annotated[
+        float | None, Field(default=None, description="过期时刻；executed 时为 null")
+    ] = None
+    wait_seconds: Annotated[
+        float, Field(description="从到达时刻到执行/过期时刻的等待秒数（含排队等待）")
+    ]
+    limiting_bucket: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "限制桶：执行时为连续补充等待最久的桶（立即可执行时为 null）；"
+                "过期时为决断时刻链上第一个余额不足的桶"
+            ),
+        ),
+    ] = None
+    balances: Annotated[
+        dict[str, BucketBalance],
+        Field(description="链上各桶在决断时刻（补充之后、扣减之前/之后）的余额"),
+    ]
+
+
+class QueueSimulateResponse(BaseModel):
+    executed_count: int
+    expired_count: int
+    results: Annotated[
+        list[QueueSimResult], Field(description="逐项排队结果，按原始输入索引升序")
+    ]
+    final_balances: Annotated[
+        dict[str, float],
+        Field(description="模拟结束时刻（最后一个队首离场时刻）所有桶的余额"),
+    ]

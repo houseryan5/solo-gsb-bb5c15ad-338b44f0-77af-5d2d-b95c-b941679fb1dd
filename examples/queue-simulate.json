@@ -1,0 +1,12 @@
+{
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10, "initial": 100},
+    {"id": "api_qps", "capacity": 5, "refill_rate": 1, "initial": 1}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 10},
+    {"id": "r2", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 6},
+    {"id": "r3", "timestamp": 2, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 12},
+    {"id": "r4", "timestamp": 8, "cost": 2, "chain": ["api_qps"], "deadline": 20}
+  ]
+}

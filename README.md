@@ -19,6 +19,8 @@
 
 以及 **候选链路由试算** 接口 `POST /route-simulate`：桶定义与 `/simulate` 相同（共享的连续补充令牌桶），但每个请求把单一 `chain` 换成多条候选链 `chains`。按时间顺序回放，逐请求在**全部桶都有余额**的候选链中，按**扣减后链上最大占用率最小**（占用率 = `(capacity − 扣减后余额) / capacity`，取链上各桶最大值；并列按候选顺序）挑选一条放行，**仅扣选中链**；无候选可行时**所有桶原子不变**，并逐候选给出首个不足桶。响应按原始索引返回选中链、余额快照、拒绝原因与终态余额。
 
+以及 **严格 FIFO 排队试算** 接口 `POST /queue-simulate`：桶与请求字段沿用 `/simulate`，并为每个请求增加不早于 `timestamp` 的 `deadline`。请求按到达时间及输入顺序排入**严格 FIFO 队列**，**仅队首可执行**——以队首各桶连续补充后的最早可执行时刻、下一次到达与 `deadline` 推进事件，到达请求不得越过队首；`deadline` 时余额充足仍原子扣减并成功，否则标记 `expired` 后继续处理后继；成本超过容量或零补充不可达的队首同样等待至 `deadline`。响应按原始索引给出 `executed`/`expired`、实际执行或过期时刻、等待秒数、限制桶与余额快照，并返回终态余额。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -39,6 +41,7 @@ docker compose up --build
 | 公平性分析接口 | http://localhost:8000/fairness-report （POST） |
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
 | 路由试算接口 | http://localhost:8000/route-simulate （POST） |
+| 排队试算接口 | http://localhost:8000/queue-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -674,6 +677,102 @@ docker compose up --build
 - r5：候选 1 的 `chain_b_api`（4）不足，选候选 0，`chain_a_api` 7→2；
 - r6：三条候选的首个不足桶分别为 `chain_a_api`（3）、`chain_b_api`（5）、`chain_a_api`（3），全部不可行 → 原子拒绝，所有桶保持，`rejections` 逐候选列出。
 
+## 请求格式 `POST /queue-simulate`
+
+桶定义与 `/simulate` 相同（共享的连续补充令牌桶）；每个请求在 `/simulate` 字段之上增加 `deadline`，请求按到达时间排入严格 FIFO 队列，仅队首可执行。
+
+```json
+{
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10, "initial": 100},
+    {"id": "api_qps", "capacity": 5, "refill_rate": 1, "initial": 1}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 10},
+    {"id": "r2", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 6},
+    {"id": "r3", "timestamp": 2, "cost": 4, "chain": ["tenant_quota", "api_qps"], "deadline": 12},
+    {"id": "r4", "timestamp": 8, "cost": 2, "chain": ["api_qps"], "deadline": 20}
+  ]
+}
+```
+
+### 字段说明
+
+**桶 `buckets[]`**：同 `/simulate`（`id` / `capacity` / `refill_rate` / 可选 `initial`）。
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` / `timestamp` / `cost` / `chain` | 是 | 同 `/simulate`；`timestamp` 即到达时刻 |
+| `deadline` | 是 | 截止时刻（秒，与 `timestamp` 同一时间原点），必须为有限数值且**不早于 `timestamp`**，否则返回 422 |
+
+### 排队语义
+
+1. **严格 FIFO**：请求按 `timestamp` 升序（同刻按输入数组顺序）入队；只有前一个队首离场（执行或过期）后，下一个请求才能成为队首——成为队首的时刻 = `max(上一个队首的离场时刻, 自己的 timestamp)`。到达事件只入队、不改变桶状态，因此**到达请求不得越过队首**。`results` 仍按原始数组顺序返回（含 `index`）。
+2. **连续补充**：与 `/simulate` 完全一致的共享令牌桶；只有队首在决断时会推进其链上各桶的时间（惰性补充、封顶 `capacity`）。
+3. **最早可执行时刻**：队首链上各桶自成为队首的时刻起连续补充，全部达到 `cost` 的最早时刻（即各桶 `(cost − 余额) / refill_rate` 等待的最大值，已满足的桶等待为 0）。
+4. **决断时刻** = `min(最早可执行时刻, max(deadline, 成为队首的时刻))`。`deadline` 在排队期间已过时，在成为队首的时刻立即决断。
+5. **执行**：决断时刻链上**每个桶**余额都 ≥ `cost`（含恰在 `deadline` 才补足的情形）→ 链上每个桶原子扣减 `cost`，`status = "executed"`，`executed_at` 为实际执行时刻。
+6. **过期**：决断时刻仍有桶不足 → 不扣任何桶（原子性），`status = "expired"`，`expired_at` 为过期时刻，随后继续处理后继请求。
+7. **不可达也等待**：`cost > capacity` 或余额不足且 `refill_rate == 0` 的队首不会提前判负，同样等待至 `deadline` 再按第 5/6 条决断。
+8. **限制桶** `limiting_bucket`：执行时为连续补充等待最久的桶（并列取链上首个；立即可执行时为 `null`）；过期时为决断时刻链上第一个余额不足的桶。
+9. **等待秒数** `wait_seconds`：从到达时刻 `timestamp` 到执行/过期时刻的总等待（含排队等待）。
+10. **终态**：`final_balances` 给出所有桶推进到最后一个队首离场时刻后的余额。
+
+### 响应示例
+
+```json
+{
+  "executed_count": 3,
+  "expired_count": 1,
+  "results": [
+    {
+      "request_id": "r1", "index": 0, "timestamp": 0.0, "deadline": 10.0,
+      "status": "executed", "executed_at": 3.0, "expired_at": null,
+      "wait_seconds": 3.0, "limiting_bucket": "api_qps",
+      "balances": {
+        "tenant_quota": {"before": 100.0, "after": 96.0},
+        "api_qps": {"before": 4.0, "after": 0.0}
+      }
+    },
+    {
+      "request_id": "r2", "index": 1, "timestamp": 1.0, "deadline": 6.0,
+      "status": "expired", "executed_at": null, "expired_at": 6.0,
+      "wait_seconds": 5.0, "limiting_bucket": "api_qps",
+      "balances": {
+        "tenant_quota": {"before": 100.0, "after": 100.0},
+        "api_qps": {"before": 3.0, "after": 3.0}
+      }
+    },
+    {
+      "request_id": "r3", "index": 2, "timestamp": 2.0, "deadline": 12.0,
+      "status": "executed", "executed_at": 7.0, "expired_at": null,
+      "wait_seconds": 5.0, "limiting_bucket": "api_qps",
+      "balances": {
+        "tenant_quota": {"before": 100.0, "after": 96.0},
+        "api_qps": {"before": 4.0, "after": 0.0}
+      }
+    },
+    {
+      "request_id": "r4", "index": 3, "timestamp": 8.0, "deadline": 20.0,
+      "status": "executed", "executed_at": 9.0, "expired_at": null,
+      "wait_seconds": 1.0, "limiting_bucket": "api_qps",
+      "balances": {
+        "api_qps": {"before": 2.0, "after": 0.0}
+      }
+    }
+  ],
+  "final_balances": {"tenant_quota": 100.0, "api_qps": 0.0}
+}
+```
+
+- r1：`api_qps` 初始 1，需等 3 秒补到 4 → t=3 执行（`tenant_quota` 100→96、`api_qps` 4→0）；
+- r2：t=1 到达但排在 r1 之后，t=3 才成为队首；`api_qps` 需再等 4 秒（t=7）超过 `deadline` 6 → t=6 到期时余额 3 仍不足，`expired`，链上各桶保持不扣；
+- r3：t=6 成为队首，`api_qps` 已补到 3，再等 1 秒 → t=7 执行；
+- r4：t=8 到达时队列已空，立即成为队首，`api_qps` 补到 1，再等 1 秒 → t=9 执行；
+- 模拟在 t=9 结束：`tenant_quota` 已补满回 100，`api_qps` 为 0。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -685,9 +784,10 @@ docker compose up --build
 - **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
 - **非法候选链**（仅 `/route-simulate`）：`chains` 为空、候选链为空、候选链内桶重复；候选链引用未定义的桶同样报 `unknown_bucket_ref`（`loc` 定位到具体候选链）；
-- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口与 `/route-simulate`）、多余字段（`extra="forbid"`）。
+- **非法 `deadline`**（仅 `/queue-simulate`）：`deadline` 缺失、非有限数值或早于 `timestamp`；
+- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口、`/route-simulate` 与 `/queue-simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate` 与 `/route-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate` 与 `/queue-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求内校验 `deadline >= timestamp`）。
 
 ## 本地调用示例
 
@@ -719,6 +819,10 @@ curl -X POST http://localhost:8000/reservation-simulate \
 curl -X POST http://localhost:8000/route-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/route-simulate.json
+
+curl -X POST http://localhost:8000/queue-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/queue-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -749,6 +853,7 @@ pytest -q
 │   ├── fairness.py      # 主体公平性分析引擎（加权 Jain 指数/最受限主体/首个短缺桶）
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
 │   ├── routing.py       # 候选链路由试算引擎（多候选链选路 + 原子扣减）
+│   ├── queueing.py      # 严格 FIFO 排队试算引擎（队首等待补充/到期，后继不越队首）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -758,6 +863,7 @@ pytest -q
 ├── examples/fairness-report.json
 ├── examples/reservation-simulate.json
 ├── examples/route-simulate.json
+├── examples/queue-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口
