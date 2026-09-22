@@ -15,6 +15,8 @@ from app.models import (
     ForecastRequest,
     ForecastResponse,
     PlanInitialBalancesResponse,
+    QueueSimulateRequest,
+    QueueSimulateResponse,
     ReservationSimulateRequest,
     ReservationSimulateResponse,
     RouteSimulateRequest,
@@ -25,6 +27,7 @@ from app.models import (
     UsageReportResponse,
 )
 from app.planner import plan_initial_balances
+from app.queueing import queue_simulate
 from app.reservation import reservation_simulate
 from app.routing import route_simulate
 from app.simulation import simulate
@@ -44,7 +47,12 @@ app = FastAPI(
         "返回逐项结果与每桶合并后的占用区间、峰值并发；"
         "以及 /route-simulate：在共享连续补充令牌桶上为携带多条候选桶链的请求选路——"
         "仅候选链全部桶有余额时可选，按扣减后链上最大占用率最小（并列按候选顺序）"
-        "确定选中链并仅扣该链，无候选可行时全部桶原子不变并给出各候选首个不足桶。"
+        "确定选中链并仅扣该链，无候选可行时全部桶原子不变并给出各候选首个不足桶；"
+        "以及 /queue-simulate：在 /simulate 的桶与请求字段上为每个请求增加不早于 "
+        "timestamp 的 deadline，请求按（到达时间, 输入顺序）排入严格 FIFO 队列，"
+        "仅队首可执行；以队首各桶连续补充后的最早可执行时刻、下一次到达与 deadline "
+        "推进事件，deadline 前（含）余额充足即原子扣减放行，否则等待至 deadline 标记 "
+        "expired 后继续处理后继（成本超过容量或零补充不可达的队首同样等到 deadline）。"
     ),
     version="1.0.0",
 )
@@ -74,6 +82,7 @@ def root():
         "fairness_report": "/fairness-report",
         "reservation_simulate": "/reservation-simulate",
         "route_simulate": "/route-simulate",
+        "queue_simulate": "/queue-simulate",
     }
 
 
@@ -125,3 +134,12 @@ def reservation_simulate_endpoint(
 )
 def route_simulate_endpoint(payload: RouteSimulateRequest) -> RouteSimulateResponse:
     return route_simulate(payload)
+
+
+@app.post(
+    "/queue-simulate",
+    response_model=QueueSimulateResponse,
+    tags=["queue"],
+)
+def queue_simulate_endpoint(payload: QueueSimulateRequest) -> QueueSimulateResponse:
+    return queue_simulate(payload)
